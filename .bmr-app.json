@@ -1,0 +1,12 @@
+{
+  "slug": "smartfarm",
+  "name": "스마트팜 대시보드",
+  "schema": "smartfarm",
+  "db_role": "smartfarm_dev",
+  "bucket": "smartfarm",
+  "function": "smartfarm-fn",
+  "secret_prefix": "SMARTFARM_",
+  "supabase_ref": "psupfmarnyxontorftio",
+  "url": "https://apps.bmrschool.net/smartfarm/",
+  "template": "bmr-app-templates v2"
+}
