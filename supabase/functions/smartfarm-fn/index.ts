@@ -1,92 +1,138 @@
-// smartfarm-fn — 스마트팜 대시보드 의 서버 함수 (시작 예시)
-// 이 파일을 고쳐 main 에 올리면(push), 이 앱의 '서버 함수 자동 배포'가 켜져 있을 때 검사 뒤 자동으로 배포됩니다.
-// 꺼져 있으면 허브 → 내 서비스 → 앱 정보 → 개발자 셀프서비스에서 켜 달라고 요청하세요 (관리자가 1클릭 승인).
-// 비밀값(SMARTFARM_…)은 같은 셀프서비스에서 직접 넣고, 로그도 그곳에서 봅니다.
-//
-// 이 예시가 보여 주는 것
-//  1) 부른 사람 확인: 로그인한 사용자의 토큰이 있으면 Supabase Auth 로 확인 (없으면 손님)
-//  2) 앱 전용 비밀값: SMARTFARM_* 이름의 함수 비밀값만 씁니다 (예: SMARTFARM_EXAMPLE_KEY)
-//  3) 이 앱 스키마(smartfarm) 조회: 함수 전용 DB 역할(smartfarm_fn, 개발자 역할 smartfarm_dev 의 권한을 물려받음)로 접속
-//     → 다른 앱 스키마·허브 표에는 권한이 없고, 개발자가 자기 비밀번호를 바꿔도 함수는 그대로 동작합니다
-//
-// 주소: https://psupfmarnyxontorftio.supabase.co/functions/v1/smartfarm-fn/<경로>
-//   GET  /health            DB 연결 확인
-//   GET  /hello             부른 사람(user)과 비밀값 설정 여부
-//   GET  /documents?collection=notice   documents 표에서 최근 20개
-//   POST /documents         (로그인 필요) { "collection": "notice", "data": { … } } 저장
-import postgres from 'npm:postgres@3.4.5';
-import { checkHubAuth, healthJson, type HubUser } from './lib/hub.ts';
+import { ZodError } from 'npm:zod@4.6.5';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { checkHubAuth, healthJson, sendHubMail } from './lib/hub.ts';
+import { ensureState, withState } from './lib/state.ts';
+import { access, requestAccess, listMembers, changeMember } from './lib/access.ts';
+import { dashboard, evaluateAndSendAlerts, getSettings, saveSettings, startDemoPump, ranges, type HistoryRange } from './lib/original-site-demo.ts';
+import { getProject, setProject, getIncidents } from './lib/project-store.ts';
+import { csvCell } from './lib/project-state.ts';
+import { saveWater } from './lib/water-store.ts';
+import { measureTank } from './lib/water-tank.ts';
 
-const FN = 'smartfarm-fn';
-const SCHEMA = 'smartfarm';
-const PREFIX = 'SMARTFARM_'; // 이 앱이 쓸 수 있는 비밀값 이름 앞부분
-const ORIGINS = ['https://apps.bmrschool.net', 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:4173', 'http://127.0.0.1:4173'];
-
-const secret = (name: string) => Deno.env.get(PREFIX + name) ?? '';
-const DB_URL = secret('DB_URL');
-// 서버리스라 연결을 적게: 최대 2개, 20초 쉬면 닫음. 트랜잭션 풀러(6543)라 prepare 끔
-const db = DB_URL ? postgres(DB_URL, { prepare: false, max: 2, idle_timeout: 20, connect_timeout: 10, onnotice: () => {} }) : null;
-
-function cors(req: Request): Record<string, string> {
-  const o = req.headers.get('Origin') ?? '';
-  return {
-    'Access-Control-Allow-Origin': ORIGINS.includes(o) ? o : ORIGINS[0],
-    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Max-Age': '600', Vary: 'Origin',
-  };
+const ORIGINS=['https://apps.bmrschool.net','http://localhost:5173','http://127.0.0.1:5173','http://localhost:4173','http://127.0.0.1:4173'];
+function cors(req:Request):Record<string,string>{
+ const origin=req.headers.get('origin')||'';
+ return {'Access-Control-Allow-Origin':ORIGINS.includes(origin)?origin:ORIGINS[0],
+ 'Access-Control-Allow-Headers':'authorization, x-client-info, apikey, content-type',
+ 'Access-Control-Allow-Methods':'GET, POST, PUT, DELETE, OPTIONS',
+ 'Access-Control-Expose-Headers':'Content-Disposition','Access-Control-Max-Age':'600',Vary:'Origin'};
 }
-const json = (req: Request, status: number, body: unknown) =>
-  new Response(JSON.stringify(body), { status, headers: { ...cors(req), 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
-
-type User = HubUser | null;
-/** Authorization: Bearer <허브 로그인 토큰> 이면 확인한다 (lib/hub.ts 의 checkHubAuth). 없거나 잘못된 토큰이면 손님(null). */
-const getUser = (req: Request): Promise<User> => checkHubAuth(req);
-const route = (req: Request) => {
-  const p = new URL(req.url).pathname; const i = p.indexOf('/' + FN);
-  return (i < 0 ? '/' : p.slice(i + FN.length + 1)).replace(/\/+$/, '') || '/';
-};
-
-Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) });
-  const o = req.headers.get('Origin');
-  if (o && !ORIGINS.includes(o)) return json(req, 403, { error: '허용되지 않은 출처입니다.' });
-  const path = route(req);
-  try {
-    if (path === '/health') {
-      // 표준 모양(lib/hub.ts 의 healthJson): 허브 운영 현황이 이 응답을 읽어 앱 상태를 보여 줍니다
-      if (!db) return json(req, 503, healthJson(false));
-      try { await db`select 1`; } catch { return json(req, 503, healthJson(false)); }
-      return json(req, 200, healthJson(true));
-    }
-    const user = await getUser(req);
-    if (path === '/hello') {
-      return json(req, 200, { app: SCHEMA, user, example_secret_set: Boolean(secret('EXAMPLE_KEY')), time: new Date().toISOString() });
-    }
-    if (!db) return json(req, 503, { error: '서버 설정이 아직 끝나지 않았습니다 (DB 연결 정보 없음).' });
-    if (path === '/documents' && req.method === 'GET') {
-      const c = new URL(req.url).searchParams.get('collection') ?? '';
-      if (!c || c.length > 100) return json(req, 400, { error: 'collection 을 적어 주세요.' });
-      // 함수는 표 주인 역할로 접속하므로 RLS 를 거치지 않는다 → 보여 줄 범위는 여기 코드에서 직접 정한다
-      const rows = await db`select id, collection, data, owner, created_at from ${db(SCHEMA)}.documents
-        where collection = ${c} order by created_at desc limit 20`;
-      return json(req, 200, { documents: rows });
-    }
-    if (path === '/documents' && req.method === 'POST') {
-      if (!user) return json(req, 401, { error: '로그인이 필요합니다.' });
-      const t = await req.text();
-      if (t.length > 16384) return json(req, 413, { error: '요청이 너무 큽니다.' });
-      let b: { collection?: unknown; data?: unknown };
-      try { b = JSON.parse(t); } catch { return json(req, 400, { error: 'JSON 형식이 아닙니다.' }); }
-      if (typeof b.collection !== 'string' || !b.collection || b.collection.length > 100) return json(req, 400, { error: 'collection 형식이 올바르지 않습니다.' });
-      if (typeof b.data !== 'object' || b.data === null || Array.isArray(b.data)) return json(req, 400, { error: 'data 는 JSON 객체여야 합니다.' });
-      const [row] = await db`insert into ${db(SCHEMA)}.documents (collection, data, owner)
-        values (${b.collection}, ${db.json(b.data as Record<string, never>)}, ${user.id}) returning id, collection, data, owner, created_at`;
-      return json(req, 201, row);
-    }
-    return json(req, 404, { error: '없는 경로입니다.' });
-  } catch (e) {
-    console.error(FN, (e as { code?: string })?.code ?? '', (e as Error)?.message ?? e);
-    return json(req, 500, { error: '서버 오류가 났습니다.', code: (e as { code?: string })?.code });
+const json=(req:Request,body:unknown,status=200)=>new Response(JSON.stringify(body),{status,headers:{...cors(req),'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}});
+function deviceAuthorized(req:Request){
+ const token=Deno.env.get('SMARTFARM_ESP32_DEVICE_TOKEN'),given=req.headers.get('authorization')||'';
+ if(!token||token.length<32||!given.startsWith('Bearer ')||given.length>512)return false;
+ const hash=(s:string)=>createHash('sha256').update(s).digest();
+ return timingSafeEqual(hash(token),hash(given.slice(7)));
+}
+async function bodyOf(req:Request){
+ const raw=await req.text();
+ if(raw.length>16384)throw new Error('payload_too_large');
+ const value=raw.trim()?JSON.parse(raw):{};
+ if(!value||typeof value!=='object'||Array.isArray(value))throw new SyntaxError('invalid_body');
+ return value as Record<string,unknown>;
+}
+async function testChat(){
+ const raw=Deno.env.get('SMARTFARM_GOOGLE_CHAT_WEBHOOK_URL');
+ if(!raw)throw new Error('Google Chat 웹훅을 SMARTFARM_GOOGLE_CHAT_WEBHOOK_URL 비밀값에 설정해 주세요.');
+ const url=new URL(raw);
+ if(url.protocol!=='https:'||url.hostname!=='chat.googleapis.com'||!url.pathname.startsWith('/v1/spaces/'))throw new Error('Google Chat HTTPS 웹훅 URL을 확인해 주세요.');
+ const result=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:'✅ 지하 스마트팜 연결 테스트\nGoogle Chat 알림이 정상적으로 연결되었습니다.'}),signal:AbortSignal.timeout(4000)});
+ if(!result.ok){await result.body?.cancel();throw new Error('Google Chat 전송에 실패했습니다.');}
+ await result.body?.cancel();
+}
+Deno.serve(async req=>{
+ if(req.method==='OPTIONS')return new Response(null,{status:204,headers:cors(req)});
+ const origin=req.headers.get('origin');
+ if(origin&&!ORIGINS.includes(origin))return json(req,{error:'허용되지 않은 출처입니다.'},403);
+ const url=new URL(req.url),marker='/smartfarm-fn',index=url.pathname.indexOf(marker);
+ const path=(index<0?url.pathname:url.pathname.slice(index+marker.length)).replace(/\/+$/,'')||'/';
+ try{
+  if(path==='/health'){await ensureState();return json(req,{...healthJson(true),dashboard_ready:true});}
+  if(path==='/hello')return json(req,{app:'smartfarm',user:await checkHubAuth(req),time:new Date().toISOString()});
+  if(path==='/device/water'&&req.method==='POST'){
+   if(!deviceAuthorized(req))return json(req,{error:'등록된 장치의 인증 토큰이 필요합니다.'},401);
+   const body=await bodyOf(req),distance=body.distanceCm;
+   if(!Object.hasOwn(body,'distanceCm')||(distance!==null&&(typeof distance!=='number'||!Number.isFinite(distance)||distance<0||distance>400)))return json(req,{error:'distanceCm은 0~400 사이 숫자 또는 null이어야 합니다.'},400);
+   return await withState(async()=>{
+    const latest=await saveWater(distance as number|null),settings=await getSettings();
+    return json(req,{ok:true,time:latest.time,measurement:measureTank(distance as number|null,settings.water)});
+   });
   }
+  const user=await checkHubAuth(req);
+  return await withState(async()=>{
+   const rights=await access(user);
+   if(path==='/session'&&req.method==='GET')return json(req,rights);
+   if(path==='/session'&&req.method==='DELETE')return json(req,{ok:true});
+   if(path==='/access'&&req.method==='POST'){
+    if(!user)return json(req,{error:'학교 앱 계정으로 로그인해 주세요.'},401);
+    return json(req,await requestAccess(user));
+   }
+   if(path==='/dashboard'&&req.method==='GET'){
+    const result=await dashboard(url.searchParams.get('range'),rights.admin);
+    try{await evaluateAndSendAlerts(result.current);}catch{console.error('smartfarm alert delivery failed');}
+    return json(req,result);
+   }
+   if(path==='/export'&&req.method==='GET'){
+    const kind=url.searchParams.get('kind'),range=(ranges.includes(url.searchParams.get('range') as HistoryRange)?url.searchParams.get('range'):'30m') as HistoryRange;
+    const kst=(time:number)=>new Date(time).toLocaleString('sv-SE',{timeZone:'Asia/Seoul'});
+    let rows:unknown[][];
+    if(kind==='incidents'){
+     if(!rights.admin)return json(req,{error:'관리자 로그인이 필요합니다.'},401);
+     const log=await getIncidents();
+     rows=[['발생 시각(KST)','종료 시각(KST)','센서','상태','발생값','하한','상한','데이터 종류'],...log.events.map(e=>[kst(e.openedAt),e.closedAt===null?'':kst(e.closedAt),e.metric,e.reason==='recovered'?'정상 복구':e.reason==='paused'?'운영 중지로 종료':e.reason==='settings_changed'?'기준 변경으로 종료':'이상 지속',e.value,e.min,e.max,'시뮬레이션'])];
+    }else{
+     const result=await dashboard(range,false);
+     rows=[['시각(KST)','pH','EC(mS/cm)','온도(°C)','습도(%)','잔여 물량(L)','데이터 종류'],...result.history.map(r=>[kst(r.time),r.ph,r.ec,r.temperature,r.humidity,r.water,'시뮬레이션'])];
+    }
+    return new Response('\uFEFF'+rows.map(r=>r.map(csvCell).join(',')).join('\r\n'),{headers:{...cors(req),'Content-Type':'text/csv; charset=utf-8','Content-Disposition':`attachment; filename="smartfarm-${kind==='incidents'?'incidents':range}.csv"`,'Cache-Control':'no-store'}});
+   }
+   if(path==='/incidents'&&req.method==='GET'){
+    if(!rights.admin)return json(req,{error:'관리자 로그인이 필요합니다.'},401);
+    const raw=Number(url.searchParams.get('page')||0),page=Number.isSafeInteger(raw)&&raw>=0?raw:0;
+    const log=await getIncidents();return json(req,{events:log.events.slice(page*50,(page+1)*50),total:log.events.length});
+   }
+   if(path==='/admins'&&req.method==='GET'){
+    if(!rights.owner||!user)return json(req,{error:'최고 관리자만 사용할 수 있습니다.'},403);
+    return json(req,{members:await listMembers(user)});
+   }
+   if(!['POST','PUT'].includes(req.method))return json(req,{error:'없는 경로입니다.'},404);
+   if(!rights.admin)return json(req,{error:'승인된 관리자 로그인이 필요합니다.'},401);
+   const body=await bodyOf(req);
+   if(path==='/settings'){await saveSettings(body);return json(req,{ok:true});}
+   if(path==='/chat-test'){await testChat();return json(req,{ok:true});}
+   if(path==='/pumps'){
+    if(body.pump!=='supply'&&body.pump!=='drain')return json(req,{error:'펌프를 확인해 주세요.'},400);
+    if(!(await getProject()).running)return json(req,{error:'프로젝트 운영이 중지되어 있습니다.'},409);
+    await startDemoPump(body.pump);return json(req,{ok:true,mode:'demo'});
+   }
+   if(path==='/sensor'){
+    const result=await dashboard('30m',true);return json(req,{ok:true,mode:'demo',sent:await evaluateAndSendAlerts(result.current)});
+   }
+   if(path==='/project'){
+    if(!rights.owner)return json(req,{error:'최고 관리자만 운영 상태를 바꿀 수 있습니다.'},403);
+    if(typeof body.running!=='boolean'||!Number.isSafeInteger(body.expected))return json(req,{error:'운영 상태를 확인해 주세요.'},400);
+    try{return json(req,{project:await setProject(body.running,body.expected as number)});}
+    catch(error){if(error instanceof Error&&error.message==='state_conflict')return json(req,{error:'다른 화면에서 상태가 바뀌었습니다. 새로고침 후 다시 시도해 주세요.'},409);throw error;}
+   }
+   if(path==='/admins'){
+    if(!rights.owner)return json(req,{error:'최고 관리자만 사용할 수 있습니다.'},403);
+    const result=await changeMember(body);
+    if('email' in result && typeof result.email === 'string'){
+     try{await sendHubMail({to:result.email,subject:'지하 스마트팜 관리자 초대',text:'지하 스마트팜 관리자로 초대되었습니다. 학교 앱 계정으로 로그인해 주세요.\nhttps://apps.bmrschool.net/smartfarm/',from_name:'지하 스마트팜'});}
+     catch{return json(req,{message:'관리자 권한은 저장했습니다. 메일은 보내지 못했으니 앱 주소를 직접 전달해 주세요.'});}
+    }
+    return json(req,result);
+   }
+   return json(req,{error:'없는 경로입니다.'},404);
+  });
+ }catch(error){
+  if(error instanceof ZodError)return json(req,{error:'설정 값을 확인해 주세요.',fields:error.issues.map(i=>i.path.join('.'))},400);
+  if(error instanceof SyntaxError)return json(req,{error:'JSON 형식이 올바르지 않습니다.'},400);
+  if(error instanceof Error&&error.message==='payload_too_large')return json(req,{error:'요청이 너무 큽니다.'},413);
+  // Never print DB URLs, webhook URLs, tokens or full dependency errors.
+  console.error('smartfarm request failed',path);
+  if(path==='/health')return json(req,healthJson(false),503);
+  if(path==='/chat-test')return json(req,{error:Deno.env.get('SMARTFARM_GOOGLE_CHAT_WEBHOOK_URL')?'Google Chat 전송에 실패했습니다. 웹훅 설정을 확인해 주세요.':'SMARTFARM_GOOGLE_CHAT_WEBHOOK_URL 비밀값에 Google Chat 웹훅을 설정해 주세요.'},503);
+  return json(req,{error:'요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.'},503);
+ }
 });
